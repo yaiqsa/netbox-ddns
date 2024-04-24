@@ -1,7 +1,11 @@
+import time
 import dns.tsigkeyring
 import dns.update
 import logging
 import socket
+import uuid
+import gssapi
+
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.functions import Length
@@ -9,7 +13,7 @@ from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 from django.urls import reverse
 from dns import rcode
-from dns.tsig import HMAC_MD5, HMAC_SHA1, HMAC_SHA224, HMAC_SHA256, HMAC_SHA384, HMAC_SHA512
+from dns.tsig import GSS_TSIG, HMAC_MD5, HMAC_SHA1, HMAC_SHA224, HMAC_SHA256, HMAC_SHA384, HMAC_SHA512
 from netaddr import IPNetwork, ip
 from typing import Optional
 
@@ -27,6 +31,7 @@ TSIG_ALGORITHM_CHOICES = (
     (str(HMAC_SHA256), 'HMAC SHA256'),
     (str(HMAC_SHA384), 'HMAC SHA384'),
     (str(HMAC_SHA512), 'HMAC SHA512'),
+    (str(GSS_TSIG), 'GSS TSIG'),
 )
 
 ACTION_CREATE = 1
@@ -80,6 +85,7 @@ class Server(models.Model):
         verbose_name=_('TSIG Key Name'),
         max_length=255,
         validators=[HostnameValidator()],
+        blank=True,
     )
     tsig_algorithm = models.CharField(
         verbose_name=_('TSIG Algorithm'),
@@ -92,6 +98,8 @@ class Server(models.Model):
         validators=[validate_base64],
         help_text=_('in base64 notation'),
     )
+
+    tsig_gss_keyring = None
 
     class Meta:
         unique_together = (
@@ -109,7 +117,15 @@ class Server(models.Model):
         self.server = self.server.lower().rstrip('.')
 
         # Ensure trailing dots from domain-style fields
-        self.tsig_key_name = normalize_fqdn(self.tsig_key_name.lower().rstrip('.'))
+        if self.tsig_algorithm != str(GSS_TSIG):
+            self.tsig_key_name = normalize_fqdn(self.tsig_key_name.lower().rstrip('.'))
+
+        # Ensure KerberosServer is set if GSS_TSIG is used
+        if self.tsig_algorithm == str(GSS_TSIG):
+            self.gss_tsig_init_ctx()
+        else:
+            if not self.tsig_key_name:
+                raise ValidationError("'TSIG Key Name' is required when GSS TSIG is not used as TSIG Algorithm")
 
     @property
     def address(self) -> Optional[str]:
@@ -118,16 +134,83 @@ class Server(models.Model):
             if family in (socket.AF_INET, socket.AF_INET6) and sockaddr[0]:
                 return sockaddr[0]
 
+    @property
+    def keyring(self):
+        if self.tsig_algorithm == str(GSS_TSIG):
+            return self.tsig_gss_keyring
+
+        return dns.tsigkeyring.from_text({self.tsig_key_name: self.tsig_key})
+
     def create_update(self, zone: str) -> dns.update.Update:
         return dns.update.Update(
             zone=normalize_fqdn(zone),
-            keyring=dns.tsigkeyring.from_text({
-                self.tsig_key_name: self.tsig_key
-            }),
+            keyring=self.keyring,
             keyname=self.tsig_key_name,
             keyalgorithm=self.tsig_algorithm
         )
 
+    @staticmethod
+    def _build_tkey_query(token, keyring, keyname):
+        # make TKEY record
+        inception_time = int(time.time())
+        tkey = dns.rdtypes.ANY.TKEY.TKEY(
+            dns.rdataclass.ANY,
+            dns.rdatatype.TKEY,
+            dns.name.from_text('gss-tsig.'),
+            inception_time,
+            inception_time,
+            3,
+            dns.rcode.NOERROR,
+            token,
+            b''
+        )
+
+        # make TKEY query
+        tkey_query = dns.message.make_query(
+            keyname,
+            dns.rdatatype.RdataType.TKEY,
+            dns.rdataclass.RdataClass.ANY
+        )
+
+        # create RRSET and add TKEY record
+        rrset = tkey_query.find_rrset(
+            tkey_query.additional,
+            keyname,
+            dns.rdataclass.RdataClass.ANY,
+            dns.rdatatype.RdataType.TKEY,
+            create=True
+        )
+        rrset.add(tkey)
+        tkey_query.keyring = keyring
+        return tkey_query
+
+    def gss_tsig_init_ctx(self):
+        server_ip = socket.gethostbyname(self.server)
+
+        # generate random name
+        random = uuid.uuid4()
+        keyname = dns.name.from_text(f"{random}")
+        spn = gssapi.Name(f'DNS@{self.server}', gssapi.NameType.hostbased_service)
+
+        # create gssapi security context and TSIG keyring
+        client_ctx = gssapi.SecurityContext(name=spn, usage='initiate')
+        tsig_key = dns.tsig.Key(keyname, client_ctx, 'gss-tsig.')
+        keyring = dns.tsigkeyring.from_text({})
+        keyring[keyname] = tsig_key
+        keyring = dns.tsig.GSSTSigAdapter(keyring)
+
+        # perform GSS-API TKEY Exchange
+        token = client_ctx.step()
+        logging.info('token -> %s', token)
+        logging.info('keyname -> %s', keyname)
+        logging.info('keyring -> %s', keyring)
+        while not client_ctx.complete:
+            tkey_query = Server._build_tkey_query(token, keyring, keyname)
+            response = dns.query.tcp(tkey_query, server_ip, timeout=10, port=53)
+            if not client_ctx.complete:
+                token = client_ctx.step(response.answer[0][0].key)
+        self.keyring = keyring
+        self.tsig_gss_keyring = keyname
 
 class ZoneQuerySet(models.QuerySet):
     def find_for_dns_name(self, dns_name: str) -> Optional['Zone']:
