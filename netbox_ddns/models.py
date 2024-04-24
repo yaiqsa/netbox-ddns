@@ -81,22 +81,23 @@ class Server(models.Model):
             MaxValueValidator(65535),
         ]
     )
+    tsig_algorithm = models.CharField(
+        verbose_name=_('TSIG Algorithm'),
+        max_length=32,  # Longest is 24 chars for historic reasons, new ones are shorter, so 32 is more than enough
+        choices=TSIG_ALGORITHM_CHOICES,
+    )
     tsig_key_name = models.CharField(
         verbose_name=_('TSIG Key Name'),
         max_length=255,
         validators=[HostnameValidator()],
         blank=True,
     )
-    tsig_algorithm = models.CharField(
-        verbose_name=_('TSIG Algorithm'),
-        max_length=32,  # Longest is 24 chars for historic reasons, new ones are shorter, so 32 is more than enough
-        choices=TSIG_ALGORITHM_CHOICES,
-    )
     tsig_key = models.CharField(
         verbose_name=_('TSIG Key'),
         max_length=512,
         validators=[validate_base64],
         help_text=_('in base64 notation'),
+        blank=True,
     )
 
     tsig_gss_keyring = None
@@ -105,7 +106,7 @@ class Server(models.Model):
         unique_together = (
             ('server', 'tsig_key_name'),
         )
-        ordering = ('server', 'tsig_key_name')
+        ordering = ('server', 'tsig_algorithm', 'tsig_key_name', 'tsig_key')
         verbose_name = _('dynamic DNS Server')
         verbose_name_plural = _('dynamic DNS Servers')
 
@@ -126,6 +127,9 @@ class Server(models.Model):
         else:
             if not self.tsig_key_name:
                 raise ValidationError("'TSIG Key Name' is required when GSS TSIG is not used as TSIG Algorithm")
+            if not self.tsig_key:
+                raise ValidationError("'TSIG Key' is required when GSS TSIG is not used as TSIG Algorithm")
+            
 
     @property
     def address(self) -> Optional[str]:
